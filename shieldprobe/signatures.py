@@ -27,8 +27,6 @@ class Signature:
     dynamic_script_regex: Optional[str] = None       # random-path dynamic JS
     env_probes: tuple[str, ...] = ()                 # expected env fingerprint probes
     meta_refresh: bool = False                       # JS/meta reload challenge
-    # Scoring weights.
-    weight: dict[str, int] = field(default_factory=dict)
 
     def score(self, evidence: "Evidence") -> tuple[int, int]:
         """Return (matched, total) indicator score for the given evidence."""
@@ -118,8 +116,6 @@ SIGNATURES: list[Signature] = [
         js_markers=("$_ts", "while(1)", "_$"),
         dynamic_script_regex=r"/[A-Za-z0-9]{10,}/[A-Za-z0-9]+\.[0-9a-f]+\.js",
         env_probes=("webdriver", "canvas", "Function", "Proxy", "queueMicrotask"),
-        weight={"status_codes": 3, "random_cookie_name": 2, "js_markers": 3,
-                "dynamic_script_regex": 2, "env_probes": 1},
     ),
     Signature(
         id="cloudflare-js-challenge",

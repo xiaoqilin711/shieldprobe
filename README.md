@@ -11,7 +11,7 @@ real browser session** to pass the challenge and crawl the underlying data.
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![PyPI](https://img.shields.io/badge/pypi-0.1.0-orange)](https://pypi.org/project/shieldprobe/)
+![version](https://img.shields.io/badge/version-0.1.0-blue)
 
 ---
 
@@ -57,7 +57,7 @@ git clone https://github.com/<you>/shieldprobe.git
 cd shieldprobe
 pip install -e .            # core
 pip install -e ".[browser]" # + playwright (for the deep probe / shield session)
-python -m playwright install chromium
+# ShieldSession drives your installed Chrome (channel="chrome") — have Chrome ready
 ```
 
 ## Quick start

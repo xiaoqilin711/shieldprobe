@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{s.id}] {s.name}")
             print(f"    status={s.status_codes or '-'} cookies={s.cookie_name_patterns or '-'}")
             print(f"    js={s.js_markers or '-'} html={s.html_markers or '-'}")
+            print(f"    env-probes={s.env_probes or '-'}")
         return 0
 
     if args.command == "fingerprints":
