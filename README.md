@@ -12,6 +12,7 @@ real browser session** to pass the challenge and crawl the underlying data.
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
+[![tests](https://github.com/xiaoqilin711/shieldprobe/actions/workflows/tests.yml/badge.svg)](https://github.com/xiaoqilin711/shieldprobe/actions/workflows/tests.yml)
 
 ---
 
