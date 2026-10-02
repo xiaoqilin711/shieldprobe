@@ -1,0 +1,391 @@
+# [原创] 某网站瑞数反爬逆向：从 412 拦截到借道浏览器会话，一次性翻完 12 页列表
+
+> 本文是 [ShieldProbe](../README.md) 的实战案例，记录一次对瑞数（RiverSecurity）动态反爬的完整逆向：
+> 从首个 412 拦截，到定性、选路线、踩坑，再到借道真实浏览器会话一次翻完 12 页列表。
+> 文中域名、cookie 名与值、channelId、文章标题、时间戳均已脱敏，均为示意值，不指向任何真实站点。
+
+> 目标：某网站「公告」列表，自动翻页抓全量条目。
+> 挡路的是一套瑞数（RiverSecurity）动态反爬：首次请求 412 拦截 + VM 混淆 JS 计算 cookie + 环境指纹校验。
+> 我没有硬还原那台虚拟机，而是借道真实浏览器把 JS 跑完、cookie 落地，再复用会话直接打分页接口。
+> 一句话链路：**requests 直连 412 → 浏览器 trace 定性为瑞数 → 三条路线选「驱动浏览器」→ 撞上 headless 翻车 → 发现列表其实是 AJAX 加载 → 复用会话 cookie 循环翻页 → 235 条一次拿全。**
+
+---
+
+## 起因：一个「看着很简单」的列表爬取
+
+需求是抓某网站「公告」频道的列表，自动翻页，把标题、链接、发布日期全量收下来。
+
+这种站点，列表页一眼看过去就是普通的 `<ul><li>` 结构，第一反应是 `requests` + `BeautifulSoup` 十分钟搞定。于是我随手一个 `curl` 先探一眼。
+
+第一脚就踢到了铁板。
+
+## 第一个异常：为什么我拿到的是 412 和一堆乱码
+
+```bash
+$ curl -I "https://www.example.com/news/list.shtml"
+HTTP/1.1 412 Precondition Failed
+Server: ***
+Date: Tue, 29 Sep 2026 09:44:09 GMT
+Content-Type: text/html; charset=utf-8
+```
+
+不是 200，是 **412 Precondition Failed**，而且响应体不是列表 HTML，而是一大段高度混淆的 JavaScript：
+
+```javascript
+if($_ts.cd){(function(_$c1,_$fy){var _$cY=0;
+  function _$c9(){var _$$y=[86];Array.prototype.push.apply(_$$y,arguments);return _$$J.apply(this,_$$y);}
+  ...
+  _$c9=_$_A['$_ts']={};        // 创建一个 $_ts 对象
+  _$c9.lcd=_$_I;               // lcd 字段
+  _$c9.aebi=[];                // aebi 字段
+  ...
+  while(1){ _$$y=_$$y[_$$y++]; if(_$$y<12){ ... } }
+})(_$ts.scj, _$ts.aebi);       // scj / aebi 作为 VM 执行上下文传入
+```
+
+几个信号同时出现，基本可以定性：
+
+1. **`$_ts` 对象** —— 这是瑞数的核心状态对象，常见字段有 `cd`（执行标志）、`scj`（VM 上下文/种子）、`aebi`（环境采集数组）、`lcd`（计算结果缓存）。本次代码里直接观察到了 `cd` / `lcd` / `aebi` / `scj` 的读写。
+2. **`while(1)` 里的字节码分发** —— `_$be = _$dq[_$__++]` 取「下一条指令」，再按数值区间 `if(_$be<12){ if(_$be<4){...} }` 跳转执行。这是典型的**自定义虚拟机（VM）**：真实业务逻辑被编译成一串字节码，运行时靠解释器逐条译码执行。
+3. **`_$fW` / `_$ej` / `_$gp` / `_$i3` / `_$$Z` / `_$cm` 这类函数名** —— 高度混淆的标识符，无任何语义。
+
+**为什么用 412？** 这是个细节：瑞数不用 403（禁止）而用 412（Precondition Failed，前提条件失败）。语义上的意思是「你缺一个前置条件——一个合法的 cookie」，然后它把「怎么算出这个 cookie」的 JS 连同响应体一起塞给你，让你的浏览器就地执行。**验证发生在客户端，而不是服务端直接拒绝。**
+
+「简单爬一下」这个假设，当场作废。得先搞清楚 cookie 到底怎么来的。
+
+## 上工具：用浏览器 trace 把链路抓成铁证
+
+靠肉眼读混淆代码不现实。我启用了基于 Firefox 内核的浏览器追踪工具，它能按类别记录 JS 运行时的各种行为：
+
+- **domtrace** —— JS 函数调用、属性读写（`get`/`set`/`call`）、定时器、XHR；
+- **descriptor** —— `Object.getOwnPropertyDescriptor` 的属性描述符探测；
+- **eval** —— 每次 `eval` 的内容（含间接 eval，正是瑞数 VM 的载体）；
+- **http** —— 完整请求/响应序列、状态码、正文（raw + decoded）。
+
+清空 cookie 后访问目标页，把整条链路录下来。先从 HTTP 序列入手，目标站相关请求被完整还原：
+
+```
+REQ  GET https://www.example.com/news/list.shtml
+RESP 412 https://www.example.com/news/list.shtml
+REQ  GET https://www.example.com/tQrlMwxgEtCS/xsWaJeZftrRw.294cc83.js
+RESP 200 https://www.example.com/tQrlMwxgEtCS/xsWaJeZftrRw.294cc83.js
+REQ  GET https://www.example.com/news/list.shtml
+RESP 200 https://www.example.com/news/list.shtml
+```
+
+链路清楚得不能再清楚：
+
+1. 第一次访问列表页 → **412**，返回混淆 HTML/JS；
+2. 浏览器按 412 正文里的指引，去拉一段**动态脚本** `tQrlMwxgEtCS/xsWaJeZftrRw.294cc83.js`——注意目录名 `tQrlMwxgEtCS` 和文件名 `xsWaJeZftrRw` 都是**每次访问随机生成**的，但后缀 `.294cc83.js` 是固定版本号，这是瑞数 6 代签名；
+3. 这段 JS 执行后，页面**自动重载**，这次返回 **200** 和真实内容。
+
+也就是说，cookie 的生成发生在「第 2 步执行动态 JS」这短短几百毫秒里。而这段 JS 就是那台 VM + 环境指纹采集的集合体。
+
+### 环境指纹采集的完整清单
+
+瑞数不只是「算个 cookie」，它在算之前会先采集一大把环境特征。追踪工具记录到的探测行为，拼出了完整清单：
+
+| 指纹点 | trace 证据（次数） | 它在防什么 |
+|---|---|---|
+| `navigator.webdriver` | descriptor 26 + domtrace 48 | Selenium/Playwright 自动化标志 |
+| `canvas` + `fillText` + `toDataURL` | 8 / 2 / 2 | canvas 像素指纹（不同显卡/浏览器渲染差异） |
+| `webgl` | 4 | WebGL 渲染器指纹 |
+| `Function` | **290** | `Function.name` / 原型是否被补环境脚本改过 |
+| `Proxy` / `queueMicrotask` | descriptor | 检测运行环境是否被代理/篡改 |
+| `screen` | 2 | 屏幕分辨率 |
+| `setInterval` / `setTimeout` | 234 / 69 | 定时器心跳（headless 环境时间行为异常） |
+
+其中 `Function` 构造器对象被触碰了 **290 次**——这是瑞数最狠的一招。补环境脚本（jsdom、vm2、Node 里手搓 browser 对象）最容易在 `Function` 构造器、`Function.prototype.toString`、`function(){}.constructor` 这些点上露出马脚，因为它们在真浏览器里的行为有大量边角 case 是模拟不出来的。瑞数专门盯着这些点反复测。
+
+`navigator.webdriver` 的探测方式也值得说：它不直接读 `navigator.webdriver`，而是用 `Object.getOwnPropertyDescriptor` 分别在 **`Navigator` 实例**和 **`NavigatorPrototype` 原型**上各查一遍。实例上没有（`found:false`），原型上有个 getter（`found:true, descriptorKind:"accessor"`）——它要确认「这个属性是真浏览器原生的 getter，而不是补环境脚本硬塞的普通值」。**只看值是不够的，要看值的来源。**
+
+```json
+{"target":{"class":"Navigator"},"prop":"webdriver","found":false,"descriptorKind":null}
+{"target":{"class":"NavigatorPrototype"},"prop":"webdriver","found":true,
+ "descriptorKind":"accessor","hasGet":true,"getterName":"get webdriver"}
+```
+
+DOM 追踪里同时看到 JS 对 cookie 的反复读写：
+
+```
+"get cookie"   (23 次)
+"set cookie"   (16 次)
+"cookieHeader" (33 次)
+```
+
+定性完毕：**这是瑞数动态反爬，核心 cookie 由混淆 JS 在客户端计算写入，计算前先做一轮环境指纹校验。**
+
+## 选路线：三条路，我为什么挑了最「偷懒」的一条
+
+摆在面前三条路：
+
+- **A：驱动真实浏览器** —— 不还原算法，让真浏览器把瑞数 JS 跑完、cookie 落地，再复用会话拿数据；
+- **B：还原 VM** —— 把那台 `while(1)` 字节码虚拟机 + 环境指纹采集逻辑完整逆出来，写成纯算法脚本；
+- **C：用现成工具** —— 找瑞数专用破解/过盾方案。
+
+我选了 A。理由很现实：这次目标是**拿到列表数据**，不是研究瑞数算法本身。瑞数 6 代的 VM 还原是个大工程——字节码要逆向、环境指纹要逐项补、而且瑞数隔段时间就换一次混淆。而驱动浏览器是唯一能「今天内出结果」的路。
+
+> 逆向要分清楚：你要的是「过程」还是「结果」——这次要结果。
+
+## 中途一次自证：三个我自己挖的坑
+
+A 路线看着简单，真做起来我连踩三个坑，每个都踩得结结实实。
+
+### 坑 1：headless Chrome 过不了第二层
+
+用 Playwright 驱动 Chrome，`headless=True` 跑，过盾判定也过了，但一看数据——**只有 2 个 cookie，正文是空的**。
+
+> 教训：瑞数不只是「验 cookie」，它还会在 JS 里做环境指纹校验。headless 模式下 `navigator.webdriver` 等特征暴露，环境指纹对不上，它算出的 cookie 是「废」的，重载拿不到真数据。
+
+解决办法是「屏幕外窗口」：`headless=False`，但把窗口丢到屏幕坐标外。窗口真实存在（有头、环境指纹对得上），但不弹出来打扰你：
+
+```python
+from playwright.sync_api import sync_playwright
+
+args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+# 屏幕外窗口：有头(能过指纹)但不打扰
+args += ["--window-position=-2000,-2000", "--window-size=1920,1080"]
+
+browser = p.chromium.launch(
+    channel="chrome",        # 用系统 Chrome，不用 Playwright 自带 Chromium
+    headless=False,          # 关键：不能 headless
+    args=args,
+)
+ctx = browser.new_context(
+    viewport={"width": 1920, "height": 1080},
+    locale="zh-CN",
+    timezone_id="Asia/Shanghai",   # 指纹对齐：时区/语言要和真实用户一致
+)
+```
+
+两个反检测细节值得单独说：
+
+- `channel="chrome"` 用**系统安装的 Chrome**，而不是 Playwright 自带的 Chromium——自带那个有更明显的自动化特征；
+- `--disable-blink-features=AutomationControlled` 关掉 Blink 引擎的 `AutomationControlled` 标志，这正是 `navigator.webdriver=true` 的来源之一。
+
+### 坑 2：过盾判定写早了
+
+我用「`<meta r='m'>` 这个混淆页标记消失」作为过盾成功条件。这个条件本身没错——412 混淆页带 `<meta r='m'>`，真实页没有。但**标记消失 ≠ 业务 JS 把 cookie 写全了**。判定一过我就急着抓数据，抓到的是半成品。
+
+> 教训：过盾判定之后，还要再等一段，让 SSO、无障碍这些业务 JS 把附加 cookie 写全，再动数据。
+
+```python
+page.wait_for_function(
+    "() => !document.querySelector(\"meta[r='m']\")", timeout=30000
+)
+page.wait_for_timeout(5000)   # 等业务 JS 写全附加 cookie
+```
+
+### 坑 3：复用 cookie 只带两个，被 400 打回来
+
+我天真地以为「瑞数就那两个 cookie（O 和 P）」，把它们抠出来塞给 `requests`，结果 **400**。
+
+回看完整 cookie 集合才发现还有个 `7d0f4f97**********`（MD5 样式的 32 位 session cookie）——这是应用层自己下发的。缺了它，接口不认。
+
+> 教训：瑞数 cookie 是「一整套」，不是「两个核心」。要复用，就带完整集合，别自作聪明挑「看起来重要」的。
+
+## 换一条思路：列表数据其实根本不在 HTML 里
+
+过了盾、拿到了第一页 HTML，准备写翻页逻辑。结果发现：**列表项不是服务端渲染进 HTML 的**，分页容器 `#page_div` 是空的。
+
+去抓前端 JS，在 `common_list.js` 里找到了真正的翻页逻辑，三段函数串成一条链：
+
+```javascript
+// 1. 发起 AJAX 请求拿当前页
+function table_ajax() {
+    $.ajax({
+        url: '/common/search/' + this.channelId +
+             '?_isAgg=false&_isJson=true&_pageSize=' + parseInt($("#pageSize").val()) +
+             '&_template=index&_rangeTimeGte=&_channelName=&page=' + parseInt($("#page").val()),
+        type: 'get',
+        success: function(data) {
+            table_page(data.data.total);        // 2. 用 total 生成分页条
+            table_each("list", ajax_success(data)); // 3. 渲染列表项
+        }
+    });
+}
+```
+
+而 `channelId` 就明晃晃放在页面的 `<meta name="channelId" content="...">` 里：
+
+```javascript
+this.channelId = $('meta[name=channelId]').attr('content');
+```
+
+于是翻页接口现形：
+
+```
+GET /common/search/{channelId}?_isAgg=false&_isJson=true&_pageSize=20&_template=index&_rangeTimeGte=&_channelName=&page={N}
+```
+
+试了一页，返回 200，JSON 结构是这样的：
+
+```json
+{"data":{"page":1,"rows":20,"total":235,"results":[
+  {"title":"关于××××××的公告（标题已脱敏）",
+   "url":"/news/202609/17*******.shtml",
+   "publishedTimeStr":"2026-09-24",
+   "publishedTime":1790*********,
+   "content":"（正文全文，篇幅较长，此处省略）…",
+   "domainMetaList":[...]}
+]}}
+```
+
+几个要点：
+
+- **`data.total`** 是总数（235），**`data.results`** 是本页列表项，字段直接摊平在顶层——`title`、`url`、`publishedTimeStr`、`publishedTime`、`content` 一眼可读，不用再解析 HTML；
+- **`url` 是相对路径**（`/news/202609/17*******.shtml`），拼上域名就是详情页地址；
+- **`content` 字段里居然直接带着正文全文**——这意味着连详情页都不用爬；
+- 更深一层的 `domainMetaList` 里还有一套「元数据集」，用 name/value/key 三元组存了「发文机关、索引号、成文日期」等扩展字段，是典型的大汉/拓尔思 CMS 结构。
+
+这个发现一下把问题简化了：**翻页不需要模拟点击、不用解析每页 HTML，直接打这个 JSON 接口就行。**
+
+## 最后一步：借道浏览器会话，循环翻页
+
+方案定型：过盾之后，用 Playwright 的 `ctx.request` 直接请求翻页接口——它**自动携带当前浏览器会话里已经生效的全部 cookie**，等于让瑞数把「门」开了之后，我踩着它的会话走。既不用研究 cookie 哪些够用，也不用担心接口被二次拦截。
+
+完整脚本如下（当时工作目录里的 `crawl_list.py`）：
+
+```python
+import sys, json, csv
+from playwright.sync_api import sync_playwright
+
+BASE = "https://www.example.com"
+LIST_URL = f"{BASE}/news/list.shtml"
+CHANNEL_ID = "..."          # 从页面 <meta name=channelId> 取
+PAGE_SIZE = 20
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        channel="chrome", headless=False,
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox",
+              "--window-position=-2000,-2000", "--window-size=1920,1080"],
+    )
+    ctx = browser.new_context(viewport={"width": 1920, "height": 1080},
+                              locale="zh-CN", timezone_id="Asia/Shanghai")
+    page = ctx.new_page()
+
+    # —— 过盾 ——
+    page.goto(LIST_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_function("() => !document.querySelector(\"meta[r='m']\")", timeout=30000)
+    page.wait_for_timeout(5000)
+
+    # —— 复用会话 cookie 循环翻页 ——
+    all_items, page_num = [], 1
+    while True:
+        url = (f"{BASE}/common/search/{CHANNEL_ID}"
+               f"?_isAgg=false&_isJson=true&_pageSize={PAGE_SIZE}"
+               f"&_template=index&_rangeTimeGte=&_channelName=&page={page_num}")
+        resp = ctx.request.get(url, headers={
+            "Referer": LIST_URL,
+            "X-Requested-With": "XMLHttpRequest",   # 模拟真实 AJAX
+        })
+        d = resp.json()["data"]
+        for it in d["results"]:
+            all_items.append({"title": it["title"],
+                              "url": BASE + it["url"],
+                              "date": it.get("publishedTimeStr")})
+        if page_num * PAGE_SIZE >= int(d["total"]):
+            break
+        page_num += 1
+```
+
+两个细节：
+
+- **`Referer` 和 `X-Requested-With` 头**要带上，模拟真实 AJAX 请求，有些服务端会校验这两个头；
+- **翻页终止用 `page * pageSize >= total`**，同时保留「`results` 为空即停」的兜底，防止接口被风控截断时 `total` 虚报导致死循环。
+
+跑起来，12 页一口气翻完：
+
+```
+page=1: +20 条，累计 20/235
+page=2: +20 条，累计 40/235
+...
+page=11: +20 条，累计 220/235
+page=12: +15 条，累计 235/235
+```
+
+## 结果：235 条，全字段无缺
+
+- **总数 235 条 = 12 页**（11×20 + 末页 15），去重后 235/235 无缺失；
+- title / url / date **零空值**；
+- 时间跨度 2021-07-28 ~ 2026-09-24，倒序；
+- 落盘 `list_data.json`（结构化）+ `list_data.csv`（Excel 可直接打开）。
+
+一条样本（值已脱敏）：
+
+```json
+{"title": "关于××××××的公告（标题已脱敏）",
+ "url": "https://www.example.com/news/202609/17*******.shtml",
+ "date": "2026-09-24",
+ "published_time": 1790*********}
+```
+
+## 顺手摸清的「双 cookie」机制
+
+过程中交叉验证出了这套瑞数的 cookie 下发逻辑（trace 工具的 HTTP 模块不记 Set-Cookie 头，换 Playwright 的 response 监听才看到，这里踩过「证据源单一」的坑）：
+
+```
+[Set-Cookie 来源] 状态码 -> cookie 名
+    412 -> 4hP44ZykCTt5O      HttpOnly  服务端 412 下发的种子（88 字，单段 base64）
+    200 -> 7d0f4f97********** HttpOnly  应用层 session（32 位 MD5）
+    200 -> Path               畸形      path=/ 被误当成名字的 cookie
+[document.cookie] 4hP44ZykCTt5P  非 HttpOnly  客户端 JS 算出（257 字，以 0 开头，4 段 '.' 分隔）
+```
+
+「O / P」是一对相邻字母，结构对比一下：
+
+| | `...O`（种子） | `...P`（计算结果） |
+|---|---|---|
+| 下发方 | 服务端 412 Set-Cookie | 客户端 `document.cookie` |
+| HttpOnly | 是（JS 读不到也写不了） | 否 |
+| 长度 | 88 字 | 257 字 |
+| 结构 | 单段 base64 | 以 `0` 开头，4 段以 `.` 分隔 |
+
+这正是瑞数 6 代「服务端种子 + 客户端计算」的双 cookie 校验：`O` 是服务端给的「题目」，`P` 是浏览器跑完 VM 算出的「答案」，两者配合服务端校验。名字本身每次会话都变，值形如：
+
+```
+4hP44ZykCTt5P = 0********.***********.***********.***********   （257 字，以 0 开头，4 段以 '.' 分隔）
+```
+
+还有个细节：那个畸形的 `Path` cookie 是 `path=/` 被浏览器误解析成「名为 `Path` 的 cookie」，值和 `path` 属性搞混了。这是某些老 CMS 的 bug，跟瑞数无关，但看到一堆 `Path` cookie 别慌。
+
+## 诚实边界：我拿到的是哪一层
+
+- **没还原 VM。** `$_ts` 里的字节码解释器、环境指纹的加密逻辑，我一个字都没逆。cookie 的算法对我仍是黑盒，我只「借」了它算出的结果。
+- **依赖真实浏览器。** 这套方案跑在 Chrome 会话上，不是纯 `requests` / 纯算法方案，没法脱离浏览器离线重放。
+- **单次会话闭环。** 没做断点续传、限速、cookie 失效自动重过盾。cookie 一过期就得从头再来。
+
+## 复盘：真正的转折点有 N 个
+
+回看这条链，转折点其实有三个，每个都对应一次「放下执念」：
+
+1. **从「还原算法」转向「借结果」** —— 我要的是数据，不是研究瑞数。硬刚 VM 是另一篇文章、另一周工期的事。
+2. **从「解析 HTML」转向「打 AJAX 接口」** —— 列表不是静态渲染，翻页有现成的 JSON 接口，直接打比模拟浏览器点分页干净一百倍。
+3. **从「抠两个 cookie」转向「复用整个会话」** —— 与其研究哪些 cookie 够用，不如让 `ctx.request` 把会话 cookie 全套带上，一个不漏。
+
+留一句给同行：**逆向最省力的姿势，往往是「让真环境把难的那步跑完，你只做后面能做的」**。别跟一台混淆虚拟机死磕，先问一句「有没有更靠外的口子」。
+
+## 后续可做
+
+- **出纯算法方案**：把 VM 还原，离线算出 cookie，脱离浏览器。难度高，但能做成可复现的 `requests` 脚本。
+- **补环境方案**：在 Node/Python 里补 `navigator`/`Function`/`Proxy`/`queueMicrotask` 等指纹，跑原版 JS。介于 A 和 B 之间。
+- **增量爬取**：存上次的 url 集合，下次只抓新增；加限速 + 失效重试，做成定时任务。
+- **正文已在 JSON 里**：`content` 字段直接带全文，想存正文不用再请求 235 个详情页。
+
+## 附：当时工作目录里的辅助文件
+
+> 以下文件属于当时的分析工作目录，含目标站真实参数与 trace 原始数据，**未随本仓库开源**。
+> 这里仅列出以说明完整工作流；代码可直接参照上文内嵌的 `crawl_list.py` 片段。
+
+| 文件 | 作用 |
+|---|---|
+| `crawl_list.py` | 最终爬虫：过盾 + 复用会话 cookie 翻页 + 落盘 JSON/CSV |
+| `get_cookie.py` | 过盾后提取 cookie、打印 Set-Cookie 来源与可复用 cookie 头 |
+| `probe_ajax.py` | 探针：验证翻页 AJAX 接口的 JSON 结构 |
+| `list_data.json` / `list_data.csv` | 爬取结果（结构化 + CSV，Excel 可直接打开） |
+| `item_sample.json` | 单条列表项的完整 JSON（含 content 正文与元数据集） |
+| `page1.html` | 第一页真实 HTML（分析 channelId / 分页逻辑用） |
+| `trace_out/` | 浏览器 trace 原始数据（domtrace/descriptor/eval/http） |
+
+> 声明：目标为公开信息站点，本文仅用于逆向技术学习与爬虫方法交流。域名、cookie 名与值、channelId、标题、时间戳均已脱敏，请勿对目标站点施加压力。

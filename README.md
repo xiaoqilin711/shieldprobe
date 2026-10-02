@@ -127,6 +127,14 @@ flowchart LR
     H --> I[structured data]
 ```
 
+## Real-world case study
+
+A full walkthrough of a RiverSecurity-family challenge — from the first `412` to a
+complete 12-page crawl — lives in [docs/case-study.md](docs/case-study.md). It covers
+the environment-fingerprint evidence, the headless-detection gotcha, the AJAX-pagination
+discovery, and the double-cookie mechanism. This is the story behind the signature
+library and the `ShieldSession`.
+
 ## Core concepts
 
 ### 1. Signatures (`shieldprobe.signatures`)
